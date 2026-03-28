@@ -22,11 +22,7 @@ def create_ssma_agent(checkpointer=None, db=None) -> Agent:
         query: Annotated[str, "Pergunta ou termos de busca para consultar a base de conhecimento SSMA."],
     ) -> str:
         """Busca documentos na base de conhecimento. Use antes de responder ao usuário."""
-        from langfuse import get_client
-        with get_client().start_as_current_span(name="rag_tool", input={"query": query}) as span:
-            result = rag.search(query)
-            span.update(output=result[:500])
-            return result
+        return rag.search(query)
 
     middleware = []
     if db is not None:

@@ -1,79 +1,273 @@
 # ui-langchain-eval
 
-Agente LangChain com API FastAPI, memória multi-turn no CosmosDB e observabilidade via Langfuse.
+API FastAPI com um agente LangChain/LangGraph para SSMA, memória multi-turn e observabilidade via Langfuse.
+
+## Visão geral
+
+O projeto expõe um agente SSMA com dois modos de execução:
+
+- `POST /invoke`: retorna a resposta completa
+- `POST /stream`: retorna a resposta via SSE
+
+O agente usa:
+
+- `AzureChatOpenAI` como LLM
+- Azure AI Search para RAG híbrido
+- `MongoDBSaver` no CosmosDB for MongoDB vCore quando configurado
+- `InMemorySaver` em desenvolvimento sem Cosmos
+- Langfuse via `CallbackHandler()` quando as variáveis de ambiente estiverem presentes
 
 ## Stack
 
 | Camada | Tecnologia |
 |--------|-----------|
-| LLM | Azure OpenAI (`AzureChatOpenAI`, deployment configurável) |
-| Framework | LangChain `create_agent` + LangGraph |
-| Memória | `MongoDBSaver` → CosmosDB for MongoDB vCore (ou `InMemorySaver` em dev) |
-| API | FastAPI + uvicorn — SSE streaming e batch |
-| Observabilidade | Langfuse (`CallbackHandler` + `propagate_attributes`) |
-| Auth | Entra ID JWT (`oid` claim) — desabilitável com `AUTH_ENABLED=false` |
-| RAG | Azure AI Search (busca híbrida vetorial + full-text) |
+| LLM | Azure OpenAI (`AzureChatOpenAI`) |
+| Orquestração | LangChain `create_agent` + LangGraph |
+| RAG | Azure AI Search (busca vetorial + textual) |
+| Memória | `MongoDBSaver` ou `InMemorySaver` |
+| API | FastAPI + uvicorn |
+| Streaming | Server-Sent Events |
+| Observabilidade | Langfuse |
+| Auth | Entra ID JWT ou usuário mock em dev |
 
 ## Estrutura
 
-```
+```text
 src/
-├── main.py                        # Entrypoint FastAPI + lifespan
+├── main.py
 ├── core/
-│   ├── config.py                  # Settings com @lru_cache
-│   └── auth.py                    # Entra ID JWT ou mock dev
+│   ├── auth.py
+│   └── config.py
 ├── routes/
-│   └── chat.py                    # POST /stream, POST /invoke
+│   └── chat.py
 ├── agents/
-│   ├── agent.py                   # Classe Agent (DI completo, Langfuse encapsulado)
-│   ├── ssma.py                    # create_ssma_agent() → Agent
-│   ├── __init__.py                # Bootstrap Cosmos + instância singleton
+│   ├── __init__.py
+│   ├── agent.py
+│   ├── ssma.py
 │   ├── middleware/
-│   │   └── chat_persistence.py    # ChatPersistenceHooks (before/after_agent → CosmosDB)
+│   │   └── chat_persistence.py
 │   └── prompts/
-│       └── ssma.md                # System prompt do agente SSMA
-├── tools/
-│   └── az_aisearch_rag.py         # AzureRAG — busca híbrida no Azure AI Search
+│       └── ssma.md
 ├── schemas/
-│   └── chat.py                    # MessageRequest, BatchResponse, ChatSummary
+│   └── chat.py
+├── tools/
+│   └── az_aisearch_rag.py
 └── utils/
-    └── setup_db.py                # Script one-off: cria índices no CosmosDB
+    └── setup_db.py
 ```
 
-## Classe Agent
+## Como funciona
 
-O coração da aplicação. Recebe tudo via `__init__` — sem globals, sem acoplamento:
+### Agente
+
+`src/agents/agent.py` encapsula a criação e execução do agente. O `thread_id` e o `user_id` são passados por chamada, não no construtor.
 
 ```python
-from src.agents.agent import Agent, make_llm
+from src.agents.agent import Agent
 
 agent = Agent(
     system_prompt="Você é...",
     tools=[minha_tool],
-    llm=make_llm(),           # opcional — cria automaticamente se omitido
-    checkpointer=checkpointer, # opcional — InMemorySaver se omitido
-    middleware=[ChatPersistenceHooks(db)],  # opcional
     name="MeuAgente",
 )
 
-# FastAPI: thread_id e user_id por chamada (multi-tenant)
-resposta = agent.invoke("Olá", thread_id="user-123_chat-abc", user_id="user-123")
-
-# SSE streaming
-async for chunk in agent.astream("Olá", thread_id="...", user_id="..."):
-    yield chunk
+answer = agent.invoke(
+    "Olá",
+    thread_id="user-123_chat-abc",
+    user_id="user-123",
+)
 ```
 
-O Langfuse (`propagate_attributes` + `CallbackHandler` + `flush`) é gerenciado internamente — ativado automaticamente quando `LANGFUSE_SECRET_KEY` e `LANGFUSE_BASE_URL` estiverem definidos.
+Para streaming:
+
+```python
+async for chunk in agent.astream(
+    "Olá",
+    thread_id="user-123_chat-abc",
+    user_id="user-123",
+):
+    print(chunk)
+```
+
+### Memória
+
+- Se `COSMOS_CONN_STRING` estiver definido, o projeto usa `MongoDBSaver`
+- Se não estiver, usa `InMemorySaver`
+- Na API, o agente é singleton por processo, então o histórico em memória persiste entre requests enquanto o processo estiver vivo
+
+### Observabilidade
+
+Quando `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` e `LANGFUSE_BASE_URL` estão disponíveis no ambiente, o projeto adiciona `CallbackHandler()` no `config` do LangChain e popula `metadata` com:
+
+- `langfuse_session_id`
+- `langfuse_user_id`
+- `langfuse_tags`
+
+## API
+
+### Endpoints
+
+| Método | Path | Descrição |
+|--------|------|-----------|
+| `GET` | `/` | Healthcheck simples |
+| `POST` | `/invoke` | Resposta completa |
+| `POST` | `/stream` | Resposta via SSE |
+
+### Body de chat
+
+```json
+{
+  "message": "O que é NR-35?",
+  "chat_id": "opcional"
+}
+```
+
+### Resposta de `/invoke`
+
+```json
+{
+  "chat_id": "verify-route-invoke",
+  "thread_id": "user-dev-user_chat-verify-route-invoke",
+  "answer": "..."
+}
+```
+
+### Eventos de `/stream`
+
+```text
+event: meta
+data: {"chat_id":"...","thread_id":"..."}
+
+event: message
+data: {"text":"chunk"}
+
+event: done
+data: {}
+```
+
+### Auth
+
+Com `AUTH_ENABLED=false`, a API usa um usuário mock:
+
+- `oid`: `dev-user`
+- `name`: `Dev User`
+- `email`: `dev@localhost`
+
+Com `AUTH_ENABLED=true`, a API valida o bearer token do Entra ID usando o `oid` do JWT como `user_id`.
+
+## Variáveis de ambiente
+
+Veja `.env.example` para o conjunto completo. As principais são:
+
+| Variável | Obrigatória | Descrição |
+|----------|-------------|-----------|
+| `AZURE_OPENAI_ENDPOINT` | sim | Endpoint do Azure OpenAI |
+| `AZURE_OPENAI_API_KEY` | sim | Chave do Azure OpenAI |
+| `AZURE_OPENAI_API_VERSION` | sim | Versão da API |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | sim | Deployment do chat model |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | não | Deployment de embeddings |
+| `AZURE_SEARCH_ENDPOINT` | sim | Endpoint do Azure AI Search |
+| `AZURE_SEARCH_API_KEY` | sim | Chave do Azure AI Search |
+| `COSMOS_CONN_STRING` | não | Habilita memória persistente |
+| `COSMOS_DB` | não | Nome do banco no Cosmos |
+| `LANGFUSE_PUBLIC_KEY` | não | Public key do Langfuse |
+| `LANGFUSE_SECRET_KEY` | não | Secret key do Langfuse |
+| `LANGFUSE_BASE_URL` | não | URL do Langfuse |
+| `AUTH_ENABLED` | não | `false` em dev para usar usuário mock |
+| `AZURE_AD_TENANT_ID` | se auth | Tenant do Entra ID |
+| `AZURE_AD_CLIENT_ID` | se auth | Client ID da app registration |
+
+Observação: `.env.example` também inclui variáveis de LangSmith, mas o fluxo principal atual do projeto está centrado em Langfuse.
+
+## Executar
+
+### Local
+
+```bash
+cp .env.example .env
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn src.main:app --reload
+```
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+No `docker-compose.yml`, `AUTH_ENABLED=false` já vem configurado para facilitar testes locais.
+
+### Setup do CosmosDB
+
+Se for usar memória persistente, crie os índices uma vez:
+
+```bash
+source .venv/bin/activate
+python -m src.utils.setup_db
+```
+
+## Exemplos de uso
+
+### `invoke`
+
+```bash
+curl -X POST http://127.0.0.1:8000/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"message":"O que é NR-35?","chat_id":"chat-demo"}'
+```
+
+### `stream`
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"O que é NR-35?","chat_id":"chat-demo"}'
+```
+
+Se `AUTH_ENABLED=true`, inclua `Authorization: Bearer <token>`.
+
+## Notebook de avaliação
+
+O notebook `notebooks/langfuse.ipynb` serve para validar o agente localmente e inspecionar traces com mais facilidade.
+
+Exemplo atualizado:
+
+```python
+ssma = Agent(
+    system_prompt=(_prompts_dir / "ssma.md").read_text().strip(),
+    tools=[rag_tool],
+    name="SSMA",
+)
+
+ssma.invoke("O que é NR-35?", thread_id="ssma-001")
+```
+
+Para streaming no notebook:
+
+```python
+async for chunk in ssma.astream("O que é NR-35?", thread_id="ssma-stream-001"):
+    print(chunk, end="", flush=True)
+```
+
+As tools do notebook são definidas inline com `@tool`, enquanto a lógica de busca pura fica em `notebooks/az_aisearch_rag.py`.
 
 ## Adicionar um novo agente
 
-1. Crie `src/agents/prompts/meu_agente.md` com o system prompt
-2. Crie `src/agents/meu_agente.py` com a factory:
+1. Crie um prompt em `src/agents/prompts/`
+2. Crie uma factory em `src/agents/`
+3. Reutilize `Agent(...)` com as tools e middleware necessários
+4. Instancie o agente em `src/agents/__init__.py`
+
+Exemplo mínimo:
 
 ```python
+from pathlib import Path
+
 from src.agents.agent import Agent
 from src.tools.az_aisearch_rag import AzureRAG
+
 
 def create_meu_agente(checkpointer=None, db=None) -> Agent:
     rag = AzureRAG(index_name="meu-index")
@@ -84,96 +278,3 @@ def create_meu_agente(checkpointer=None, db=None) -> Agent:
         name="MeuAgente",
     )
 ```
-
-3. Instancie em `src/agents/__init__.py` passando o checkpointer e `db` já configurados.
-
-## API
-
-| Método | Path | Descrição |
-|--------|------|-----------|
-| `POST` | `/stream` | Resposta em tempo real via SSE |
-| `POST` | `/invoke` | Resposta completa |
-
-### Eventos SSE (`/stream`)
-
-```
-event: meta
-data: {"chat_id": "...", "thread_id": "..."}
-
-event: message
-data: {"text": "chunk de texto"}
-
-event: done
-data: {}
-```
-
-### Body das requests de chat
-
-```json
-{
-  "message": "O que é NR-35?",
-  "chat_id": "uuid-existente-opcional"
-}
-```
-
-## Variáveis de ambiente
-
-Ver `.env.example` para a lista completa com descrições. Principais:
-
-| Variável | Obrigatória | Descrição |
-|----------|-------------|-----------|
-| `AZURE_OPENAI_ENDPOINT` | sim | URL do recurso Azure OpenAI |
-| `AZURE_OPENAI_API_KEY` | sim | Chave de autenticação |
-| `AZURE_OPENAI_API_VERSION` | sim | Versão da API (ex: `2025-03-01-preview`) |
-| `AZURE_OPENAI_DEPLOYMENT_NAME` | sim | Nome do deployment (ex: `gpt-5-chat`) |
-| `AZURE_SEARCH_ENDPOINT` | sim | URL do Azure AI Search |
-| `AZURE_SEARCH_API_KEY` | sim | Chave do Azure AI Search |
-| `COSMOS_CONN_STRING` | não | Memória persistente (MongoDB vCore). Se ausente, usa `InMemorySaver` |
-| `COSMOS_DB` | não | Nome do banco (padrão: `langgraph`) |
-| `LANGFUSE_SECRET_KEY` | não | Ativa observabilidade Langfuse |
-| `LANGFUSE_BASE_URL` | não | URL do Langfuse (ex: `http://localhost:3000`) |
-| `AUTH_ENABLED` | não | `false` para desabilitar JWT em dev (padrão: `true`) |
-| `AZURE_AD_TENANT_ID` | se auth | Tenant ID do Entra ID |
-| `AZURE_AD_CLIENT_ID` | se auth | Client ID do app registration |
-
-## Executar
-
-```bash
-# Dev local
-cp .env.example .env  # preencha os valores
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn src.main:app --reload
-```
-
-```bash
-# Dev com Docker (AUTH_ENABLED=false automático)
-docker compose up
-```
-
-```bash
-# Setup índices CosmosDB (executar uma vez)
-python -m src.utils.setup_db
-```
-
-## Notebook de avaliação
-
-`notebooks/langfuse.ipynb` — testa o agente localmente com tracing completo.
-
-Instancia agentes explicitamente com injeção de dependência:
-
-```python
-ssma = Agent(
-    system_prompt=(_prompts_dir / "ssma.md").read_text().strip(),
-    tools=[rag_tool],
-    thread_id="ssma-001",
-    user_id="andre@empresa.com",  # propagado ao Langfuse como user_id
-    name="SSMA",
-)
-ssma.invoke("O que é NR-35?")
-```
-
-As tools com `@tool` são definidas inline no notebook para garantir que o `CallbackHandler` do Langfuse propague o tracing corretamente. A lógica pura (busca, embeddings) fica em `notebooks/tools.py`.
-
-O tracing é encapsulado na classe `Agent`: `propagate_attributes(session_id=thread_id, user_id=user_id)` + `CallbackHandler()` + `flush()` — ativado automaticamente quando `LANGFUSE_SECRET_KEY` e `LANGFUSE_BASE_URL` estiverem definidos.
-# ui-langchain-eval
